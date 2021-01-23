@@ -13,13 +13,16 @@ import (
 	"strings"
 
 	"github.com/meowgorithm/babyenv"
+	gap "github.com/muesli/go-app-paths"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"golang.org/x/crypto/ssh/terminal"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/charm/ui/common"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/glow/ui"
+	"github.com/charmbracelet/glow/utils"
 )
 
 var (
@@ -27,14 +30,16 @@ var (
 	CommitSHA = ""
 
 	readmeNames  = []string{"README.md", "README"}
+	configFile   string
 	pager        bool
 	style        string
 	width        uint
 	showAllFiles bool
 	localOnly    bool
+	mouse        bool
 
 	rootCmd = &cobra.Command{
-		Use:              "glow SOURCE",
+		Use:              "glow [SOURCE|DIR]",
 		Short:            "Render markdown on the CLI, with pizzazz!",
 		Long:             formatBlock(fmt.Sprintf("\nRender markdown on the CLI, %s!", common.Keyword("with pizzazz"))),
 		SilenceErrors:    false,
@@ -130,7 +135,23 @@ func sourceFromArg(arg string) (*source, error) {
 	return &source{r, u}, err
 }
 
-func validateOptions(cmd *cobra.Command) {
+func validateOptions(cmd *cobra.Command) error {
+	// grab config values from Viper
+	width = viper.GetUint("width")
+	localOnly = viper.GetBool("local")
+	mouse = viper.GetBool("mouse")
+
+	// validate the glamour style
+	style = viper.GetString("style")
+	if style != "auto" && glamour.DefaultStyles[style] == nil {
+		style = utils.ExpandPath(style)
+		if _, err := os.Stat(style); os.IsNotExist(err) {
+			return fmt.Errorf("Specified style does not exist: %s", style)
+		} else if err != nil {
+			return err
+		}
+	}
+
 	isTerminal := terminal.IsTerminal(int(os.Stdout.Fd()))
 	// We want to use a special no-TTY style, when stdout is not a terminal
 	// and there was no specific style passed by arg
@@ -139,42 +160,60 @@ func validateOptions(cmd *cobra.Command) {
 	}
 
 	// Detect terminal width
-	if isTerminal && !cmd.Flags().Changed("width") {
+	if isTerminal && width == 0 && !cmd.Flags().Changed("width") {
 		w, _, err := terminal.GetSize(int(os.Stdout.Fd()))
 		if err == nil {
 			width = uint(w)
+		}
+
+		if width > 120 {
+			width = 120
 		}
 	}
 	if width == 0 {
 		width = 80
 	}
-	if width > 120 {
-		width = 120
-	}
+	return nil
 }
 
 func execute(cmd *cobra.Command, args []string) error {
-	validateOptions(cmd)
-
-	if len(args) == 0 {
-		return executeArg(cmd, "", os.Stdout)
+	initConfig()
+	if err := validateOptions(cmd); err != nil {
+		return err
 	}
 
-	for _, arg := range args {
-		if err := executeArg(cmd, arg, os.Stdout); err != nil {
-			return err
+	switch len(args) {
+
+	// TUI running on cwd
+	case 0:
+		return runTUI("", false)
+
+	// TUI with possible dir argument
+	case 1:
+		// Validate that the argument is a directory. If it's not treat it as
+		// an argument to the non-TUI version of Glow (via fallthrough).
+		info, err := os.Stat(args[0])
+		if err == nil && info.IsDir() {
+			p, err := filepath.Abs(args[0])
+			if err == nil {
+				return runTUI(p, false)
+			}
+		}
+		fallthrough
+
+	// CLI
+	default:
+		for _, arg := range args {
+			if err := executeArg(cmd, arg, os.Stdout); err != nil {
+				return err
+			}
 		}
 	}
+
 	return nil
 }
 
 func executeArg(cmd *cobra.Command, arg string, w io.Writer) error {
-
-	// Only run TUI if there are no arguments (excluding flags)
-	if arg == "" {
-		return runTUI(false)
-	}
-
 	// create an io.Reader from the markdown source in cli-args
 	src, err := sourceFromArg(arg)
 	if err != nil {
@@ -185,6 +224,8 @@ func executeArg(cmd *cobra.Command, arg string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
+
+	b = utils.RemoveFrontmatter(b)
 
 	// render
 	var baseURL string
@@ -246,7 +287,7 @@ func executeArg(cmd *cobra.Command, arg string, w io.Writer) error {
 	return nil
 }
 
-func runTUI(stashedOnly bool) error {
+func runTUI(workingDirectory string, stashedOnly bool) error {
 	// Read environment to get debugging stuff
 	var cfg ui.Config
 	if err := babyenv.Parse(&cfg); err != nil {
@@ -262,22 +303,29 @@ func runTUI(stashedOnly bool) error {
 		defer f.Close()
 	}
 
+	cfg.WorkingDirectory = workingDirectory
+	cfg.DocumentTypes = ui.NewDocTypeSet()
 	cfg.ShowAllFiles = showAllFiles
+	cfg.GlamourMaxWidth = width
+	cfg.GlamourStyle = style
 
 	if stashedOnly {
-		cfg.DocumentTypes = ui.StashedDocuments | ui.NewsDocuments
+		cfg.DocumentTypes.Add(ui.StashedDoc, ui.NewsDoc)
 	} else if localOnly {
-		cfg.DocumentTypes = ui.LocalDocuments
+		cfg.DocumentTypes.Add(ui.LocalDoc)
 	}
 
 	// Run Bubble Tea program
-	p := ui.NewProgram(style, cfg)
+	p := ui.NewProgram(cfg)
 	p.EnterAltScreen()
+	defer p.ExitAltScreen()
+	if mouse {
+		p.EnableMouseCellMotion()
+		defer p.DisableMouseCellMotion()
+	}
 	if err := p.Start(); err != nil {
 		return err
 	}
-	p.ExitAltScreen()
-	p.DisableMouseCellMotion()
 
 	// Exit message
 	fmt.Printf("\n  Thanks for using Glow!\n\n")
@@ -286,7 +334,7 @@ func runTUI(stashedOnly bool) error {
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		os.Exit(-1)
+		os.Exit(1)
 	}
 }
 
@@ -300,14 +348,62 @@ func init() {
 	}
 	rootCmd.Version = Version
 
+	scope := gap.NewScope(gap.User, "glow")
+	defaultConfigFile, _ := scope.ConfigPath("glow.yml")
+
 	// "Glow Classic" cli arguments
+	rootCmd.PersistentFlags().StringVar(&configFile, "config", "", fmt.Sprintf("config file (default %s)", defaultConfigFile))
 	rootCmd.Flags().BoolVarP(&pager, "pager", "p", false, "display with pager")
 	rootCmd.Flags().StringVarP(&style, "style", "s", "auto", "style name or JSON path")
 	rootCmd.Flags().UintVarP(&width, "width", "w", 0, "word-wrap at width")
 	rootCmd.Flags().BoolVarP(&showAllFiles, "all", "a", false, "show system files and directories (TUI-mode only)")
 	rootCmd.Flags().BoolVarP(&localOnly, "local", "l", false, "show local files only; no network (TUI-mode only)")
+	rootCmd.Flags().BoolVarP(&mouse, "mouse", "m", false, "enable mouse wheel (TUI-mode only)")
+	rootCmd.Flags().MarkHidden("mouse")
+
+	// Config bindings
+	_ = viper.BindPFlag("style", rootCmd.Flags().Lookup("style"))
+	_ = viper.BindPFlag("width", rootCmd.Flags().Lookup("width"))
+	_ = viper.BindPFlag("local", rootCmd.Flags().Lookup("local"))
+	_ = viper.BindPFlag("mouse", rootCmd.Flags().Lookup("mouse"))
+	viper.SetDefault("style", "auto")
+	viper.SetDefault("width", 0)
+	viper.SetDefault("local", "false")
 
 	// Stash
 	stashCmd.PersistentFlags().StringVarP(&memo, "memo", "m", "", "memo/note for stashing")
 	rootCmd.AddCommand(stashCmd)
+
+	rootCmd.AddCommand(configCmd)
+}
+
+func initConfig() {
+	if configFile != "" {
+		viper.SetConfigFile(configFile)
+	} else {
+		scope := gap.NewScope(gap.User, "glow")
+		dirs, err := scope.ConfigDirs()
+		if err != nil {
+			fmt.Println("Can't retrieve default config. Please manually pass a config file with '--config'")
+			os.Exit(1)
+		}
+
+		for _, v := range dirs {
+			viper.AddConfigPath(v)
+		}
+		viper.SetConfigName("glow")
+		viper.SetConfigType("yaml")
+	}
+
+	viper.SetEnvPrefix("glow")
+	viper.AutomaticEnv()
+
+	if err := viper.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+			fmt.Println("Error parsing config:", err)
+			os.Exit(1)
+		}
+	}
+
+	// fmt.Println("Using config file:", viper.ConfigFileUsed())
 }

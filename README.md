@@ -3,7 +3,7 @@
 Render markdown on the CLI, with _pizzazz_!
 
 <p align="center">
-    <img src="https://stuff.charm.sh/glow-github.gif" alt="Glow Logo">
+    <img src="https://stuff.charm.sh/glow/glow-banner-github.gif" alt="Glow Logo">
     <a href="https://github.com/charmbracelet/glow/releases"><img src="https://img.shields.io/github/release/charmbracelet/glow.svg" alt="Latest Release"></a>
     <a href="https://pkg.go.dev/github.com/charmbracelet/glow?tab=doc"><img src="https://godoc.org/github.com/golang/gddo?status.svg" alt="GoDoc"></a>
     <a href="https://github.com/charmbracelet/glow/actions"><img src="https://github.com/charmbracelet/glow/workflows/build/badge.svg" alt="Build Status"></a>
@@ -11,7 +11,7 @@ Render markdown on the CLI, with _pizzazz_!
 </p>
 
 <p align="center">
-    <img src="https://stuff.charm.sh/glow2-ui-github.gif" width="600" alt="Glow UI Demo">
+    <img src="https://stuff.charm.sh/glow/glow-1.3-trailer-github.gif" width="600" alt="Glow UI Demo">
 </p>
 
 ## What is it?
@@ -49,6 +49,12 @@ nix-env -iA nixpkgs.glow
 
 # FreeBSD
 pkg install glow
+
+# Solus
+eopkg install glow
+
+# Windows (with Scoop)
+scoop install glow
 ```
 
 Or download a binary from the [releases][releases] page. MacOS, Linux, Windows,
@@ -165,6 +171,25 @@ glow --help
 Check out the [Glamour Style Section](https://github.com/charmbracelet/glamour/blob/master/styles/gallery/README.md)
 to find more styles. Or [make your own](https://github.com/charmbracelet/glamour/tree/master/styles)!
 
+## The Config File
+
+If you find yourself supplying the same flags to `glow` all the time, it's
+probably a good idea to create a config file. Run `glow config`, which will open
+it in your favorite $EDITOR. Alternatively you can manually put a file named
+`glow.yml` in the default config path of you platform. If you're not sure where
+that is, please refer to `glow --help`.
+
+Here's an example config:
+
+```yaml
+# style name or JSON path (default "auto")
+style: "light"
+# show local files only; no network (TUI-mode only)
+local: true
+# word-wrap at width
+width: 80
+```
+
 ## 🔒 Encryption: How It Works
 
 Encryption works by issuing symmetric keys (basically a generated password) and
@@ -184,7 +209,7 @@ machine and not our server, so we never see any unencrypted data.
 
 Part of [Charm](https://charm.sh).
 
-<a href="https://charm.sh/"><img alt="the Charm logo" src="https://stuff.charm.sh/charm-badge.jpg" width="400"></a>
+<a href="https://charm.sh/"><img alt="The Charm logo" src="https://stuff.charm.sh/charm-badge-unrounded.jpg" width="400"></a>
 
 Charm热爱开源! / Charm loves open source!
 

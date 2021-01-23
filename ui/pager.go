@@ -12,63 +12,44 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/charm"
-	"github.com/charmbracelet/charm/ui/common"
+	lib "github.com/charmbracelet/charm/ui/common"
 	"github.com/charmbracelet/glamour"
 	runewidth "github.com/mattn/go-runewidth"
 	"github.com/muesli/reflow/ansi"
+	"github.com/muesli/reflow/truncate"
 	te "github.com/muesli/termenv"
 )
 
-const (
-	maxDocumentWidth = 120
-	statusBarHeight  = 1
-	gray             = "#333333"
-	yellowGreen      = "#ECFD65"
-	fuschia          = "#EE6FF8"
-	mintGreen        = "#89F0CB"
-	darkGreen        = "#1C8760"
-	noteHeadingText  = " Set Memo "
-	notePromptText   = " > "
-)
+const statusBarHeight = 1
 
 var (
 	pagerHelpHeight int
 
-	noteHeading = te.String(noteHeadingText).
-			Foreground(common.Cream.Color()).
-			Background(common.Green.Color()).
+	mintGreen = lib.NewColorPair("#89F0CB", "#89F0CB")
+	darkGreen = lib.NewColorPair("#1C8760", "#1C8760")
+
+	noteHeading = te.String(" Set Memo ").
+			Foreground(lib.Cream.Color()).
+			Background(lib.Green.Color()).
 			String()
 
-	statusBarBg     = common.NewColorPair("#242424", "#E6E6E6")
-	statusBarNoteFg = common.NewColorPair("#7D7D7D", "#656565")
+	statusBarNoteFg = lib.NewColorPair("#7D7D7D", "#656565")
+	statusBarBg     = lib.NewColorPair("#242424", "#E6E6E6")
 
-	// Styling functions.
-	statusBarScrollPosStyle        = newStyle(common.NewColorPair("#5A5A5A", "#949494").String(), statusBarBg.String())
-	statusBarNoteStyle             = newStyle(statusBarNoteFg.String(), statusBarBg.String())
-	statusBarHelpStyle             = newStyle(statusBarNoteFg.String(), common.NewColorPair("#323232", "#DCDCDC").String())
-	statusBarStashDotStyle         = newStyle(common.Green.String(), statusBarBg.String())
-	statusBarMessageStyle          = newStyle(mintGreen, darkGreen)
-	statusBarMessageStashIconStyle = newStyle(mintGreen, darkGreen)
-	statusBarMessageScrollPosStyle = newStyle(mintGreen, darkGreen)
-	statusBarMessageHelpStyle      = newStyle("#B6FFE4", common.Green.String())
-
-	helpViewStyle = newStyle(statusBarNoteFg.String(), common.NewColorPair("#1B1B1B", "#f2f2f2").String())
+	// Styling funcs.
+	statusBarScrollPosStyle        = newStyle(lib.NewColorPair("#5A5A5A", "#949494"), statusBarBg, false)
+	statusBarNoteStyle             = newStyle(statusBarNoteFg, statusBarBg, false)
+	statusBarHelpStyle             = newStyle(statusBarNoteFg, lib.NewColorPair("#323232", "#DCDCDC"), false)
+	statusBarStashDotStyle         = newStyle(lib.Green, statusBarBg, false)
+	statusBarMessageStyle          = newStyle(mintGreen, darkGreen, false)
+	statusBarMessageStashIconStyle = newStyle(mintGreen, darkGreen, false)
+	statusBarMessageScrollPosStyle = newStyle(mintGreen, darkGreen, false)
+	statusBarMessageHelpStyle      = newStyle(lib.NewColorPair("#B6FFE4", "#B6FFE4"), lib.Green, false)
+	helpViewStyle                  = newStyle(statusBarNoteFg, lib.NewColorPair("#1B1B1B", "#f2f2f2"), false)
 )
-
-// Returns a termenv style.
-func newStyle(fg, bg string) func(string) string {
-	return te.Style{}.
-		Foreground(te.ColorProfile().Color(fg)).
-		Background(te.ColorProfile().Color(bg)).
-		Styled
-}
 
 type contentRenderedMsg string
 type noteSavedMsg *charm.Markdown
-type stashSuccessMsg markdown
-type stashErrMsg struct{ err error }
-
-func (s stashErrMsg) Error() string { return s.err.Error() }
 
 type pagerState int
 
@@ -81,16 +62,12 @@ const (
 )
 
 type pagerModel struct {
-	cc           *charm.Client
-	authStatus   authStatus
-	viewport     viewport.Model
-	state        pagerState
-	glamourStyle string
-	width        int
-	height       int
-	showHelp     bool
-	textInput    textinput.Model
-	spinner      spinner.Model
+	common    *commonModel
+	viewport  viewport.Model
+	state     pagerState
+	showHelp  bool
+	textInput textinput.Model
+	spinner   spinner.Model
 
 	statusMessage      string
 	statusMessageTimer *time.Timer
@@ -104,24 +81,25 @@ type pagerModel struct {
 	stashedDocument *markdown
 }
 
-func newPagerModel(as authStatus, glamourStyle string) pagerModel {
+func newPagerModel(common *commonModel) pagerModel {
 	// Init viewport
 	vp := viewport.Model{}
 	vp.YPosition = 0
 	vp.HighPerformanceRendering = config.HighPerformancePager
 
-	// Init text input UI for notes/memos
+	// Text input for notes/memos
 	ti := textinput.NewModel()
-	ti.Prompt = te.String(notePromptText).
-		Foreground(te.ColorProfile().Color(gray)).
-		Background(te.ColorProfile().Color(yellowGreen)).
+	ti.Prompt = te.String(" > ").
+		Foreground(lib.Color(darkGray)).
+		Background(lib.YellowGreen.Color()).
 		String()
-	ti.TextColor = gray
-	ti.BackgroundColor = yellowGreen
-	ti.CursorColor = fuschia
+	ti.TextColor = darkGray
+	ti.BackgroundColor = lib.YellowGreen.String()
+	ti.CursorColor = lib.Fuschia.String()
 	ti.CharLimit = noteCharacterLimit
 	ti.Focus()
 
+	// Text input for search
 	sp := spinner.NewModel()
 	sp.ForegroundColor = statusBarNoteFg.String()
 	sp.BackgroundColor = statusBarBg.String()
@@ -129,21 +107,20 @@ func newPagerModel(as authStatus, glamourStyle string) pagerModel {
 	sp.MinimumLifetime = time.Millisecond * 180
 
 	return pagerModel{
-		state:        pagerStateBrowse,
-		authStatus:   as,
-		glamourStyle: glamourStyle,
-		textInput:    ti,
-		viewport:     vp,
-		spinner:      sp,
+		common:    common,
+		state:     pagerStateBrowse,
+		textInput: ti,
+		viewport:  vp,
+		spinner:   sp,
 	}
 }
 
 func (m *pagerModel) setSize(w, h int) {
-	m.width = w
-	m.height = h
 	m.viewport.Width = w
 	m.viewport.Height = h - statusBarHeight
-	m.textInput.Width = w - len(noteHeadingText) - len(notePromptText) - 1
+	m.textInput.Width = w -
+		ansi.PrintableRuneWidth(noteHeading) -
+		ansi.PrintableRuneWidth(m.textInput.Prompt) - 1
 
 	if m.showHelp {
 		if pagerHelpHeight == 0 {
@@ -159,7 +136,7 @@ func (m *pagerModel) setContent(s string) {
 
 func (m *pagerModel) toggleHelp() {
 	m.showHelp = !m.showHelp
-	m.setSize(m.width, m.height)
+	m.setSize(m.common.width, m.common.height)
 	if m.viewport.PastBottom() {
 		m.viewport.GotoBottom()
 	}
@@ -193,7 +170,7 @@ func (m *pagerModel) unload() {
 	m.textInput.Reset()
 }
 
-func (m pagerModel) Update(msg tea.Msg) (pagerModel, tea.Cmd) {
+func (m pagerModel) update(msg tea.Msg) (pagerModel, tea.Cmd) {
 	var (
 		cmd  tea.Cmd
 		cmds []tea.Cmd
@@ -211,7 +188,7 @@ func (m pagerModel) Update(msg tea.Msg) (pagerModel, tea.Cmd) {
 				var cmd tea.Cmd
 				if m.textInput.Value() != m.currentDocument.Note { // don't update if the note didn't change
 					m.currentDocument.Note = m.textInput.Value() // update optimistically
-					cmd = saveDocumentNote(m.cc, m.currentDocument.ID, m.currentDocument.Note)
+					cmd = saveDocumentNote(m.common.cc, m.currentDocument.ID, m.currentDocument.Note)
 				}
 				m.state = pagerStateBrowse
 				m.textInput.Reset()
@@ -235,8 +212,8 @@ func (m pagerModel) Update(msg tea.Msg) (pagerModel, tea.Cmd) {
 					cmds = append(cmds, viewport.Sync(m.viewport))
 				}
 			case "m":
-				isStashed := m.currentDocument.markdownType == stashedMarkdown ||
-					m.currentDocument.markdownType == convertedMarkdown
+				isStashed := m.currentDocument.docType == StashedDoc ||
+					m.currentDocument.docType == ConvertedDoc
 
 				// Users can only set the note on user-stashed markdown
 				if !isStashed {
@@ -257,20 +234,28 @@ func (m pagerModel) Update(msg tea.Msg) (pagerModel, tea.Cmd) {
 					m.textInput.CursorEnd()
 				}
 
-				return m, textinput.Blink(m.textInput)
+				return m, textinput.Blink
 			case "s":
-				if m.authStatus != authOK {
+				if m.common.authStatus != authOK {
+					break
+				}
+
+				md := m.currentDocument
+
+				_, alreadyStashed := m.common.filesStashed[md.stashID]
+				if alreadyStashed {
+					cmds = append(cmds, m.showStatusMessage("Already stashed"))
 					break
 				}
 
 				// Stash a local document
-				if m.state != pagerStateStashing && m.currentDocument.markdownType == localMarkdown {
+				if m.state != pagerStateStashing && stashableDocTypes.Contains(md.docType) {
 					m.state = pagerStateStashing
 					m.spinner.Start()
 					cmds = append(
 						cmds,
-						stashDocument(m.cc, m.currentDocument),
-						spinner.Tick(m.spinner),
+						stashDocument(m.common.cc, md),
+						spinner.Tick,
 					)
 				}
 			case "?":
@@ -283,15 +268,18 @@ func (m pagerModel) Update(msg tea.Msg) (pagerModel, tea.Cmd) {
 
 	case spinner.TickMsg:
 		if m.state == pagerStateStashing || m.spinner.Visible() {
-			newSpinnerModel, cmd := spinner.Update(msg, m.spinner)
+			// If we're still stashing, or if the spinner still needs to
+			// finish, spin it along.
+			newSpinnerModel, cmd := m.spinner.Update(msg)
 			m.spinner = newSpinnerModel
 			cmds = append(cmds, cmd)
 		} else if m.state == pagerStateStashSuccess && !m.spinner.Visible() {
+			// If the spinner's finished and we haven't told the user the
+			// stash was successful, do that.
 			m.state = pagerStateBrowse
 			m.currentDocument = *m.stashedDocument
 			m.stashedDocument = nil
-			cmd := m.showStatusMessage("Stashed!")
-			cmds = append(cmds, cmd)
+			cmds = append(cmds, m.showStatusMessage("Stashed!"))
 		}
 
 	// Glow has rendered the content
@@ -313,29 +301,31 @@ func (m pagerModel) Update(msg tea.Msg) (pagerModel, tea.Cmd) {
 		// item to the stash listing.
 		m.state = pagerStateStashSuccess
 		if !m.spinner.Visible() {
+			// The spinner has finished spinning, so tell the user the stash
+			// was successful.
 			m.state = pagerStateBrowse
 			m.currentDocument = markdown(msg)
-			cmd := m.showStatusMessage("Stashed!")
-			cmds = append(cmds, cmd)
+			cmds = append(cmds, m.showStatusMessage("Stashed!"))
 		} else {
+			// The spinner is still spinning, so just take note of the newly
+			// stashed document for now.
 			md := markdown(msg)
 			m.stashedDocument = &md
 		}
 
-	case stashErrMsg:
-		// TODO
+	case stashFailMsg:
+		delete(m.common.filesStashed, msg.markdown.stashID)
 
 	case statusMessageTimeoutMsg:
-		// Hide the status message bar
 		m.state = pagerStateBrowse
 	}
 
 	switch m.state {
 	case pagerStateSetNote:
-		m.textInput, cmd = textinput.Update(msg, m.textInput)
+		m.textInput, cmd = m.textInput.Update(msg)
 		cmds = append(cmds, cmd)
 	default:
-		m.viewport, cmd = viewport.Update(msg, m.viewport)
+		m.viewport, cmd = m.viewport.Update(msg)
 		cmds = append(cmds, cmd)
 	}
 
@@ -344,7 +334,7 @@ func (m pagerModel) Update(msg tea.Msg) (pagerModel, tea.Cmd) {
 
 func (m pagerModel) View() string {
 	var b strings.Builder
-	fmt.Fprint(&b, viewport.View(m.viewport)+"\n")
+	fmt.Fprint(&b, m.viewport.View()+"\n")
 
 	// Footer
 	switch m.state {
@@ -355,7 +345,7 @@ func (m pagerModel) View() string {
 	}
 
 	if m.showHelp {
-		fmt.Fprint(&b, m.helpView())
+		fmt.Fprint(&b, "\n"+m.helpView())
 	}
 
 	return b.String()
@@ -368,7 +358,7 @@ func (m pagerModel) statusBarView(b *strings.Builder) {
 		percentToStringMagnitude float64 = 100.0
 	)
 	var (
-		isStashed         bool = m.currentDocument.markdownType == stashedMarkdown || m.currentDocument.markdownType == convertedMarkdown
+		isStashed         bool = m.currentDocument.docType == StashedDoc || m.currentDocument.docType == ConvertedDoc
 		showStatusMessage bool = m.state == pagerStateStatusMessage
 	)
 
@@ -396,7 +386,7 @@ func (m pagerModel) statusBarView(b *strings.Builder) {
 	var statusIndicator string
 	if m.state == pagerStateStashing || m.state == pagerStateStashSuccess {
 		if m.spinner.Visible() {
-			statusIndicator = statusBarNoteStyle(" ") + spinner.View(m.spinner)
+			statusIndicator = statusBarNoteStyle(" ") + m.spinner.View()
 		}
 	} else if isStashed && showStatusMessage {
 		statusIndicator = statusBarMessageStashIconStyle(" " + pagerStashIcon)
@@ -407,20 +397,20 @@ func (m pagerModel) statusBarView(b *strings.Builder) {
 	// Note
 	var note string
 	if showStatusMessage {
-		note = "Stashed!"
+		note = m.statusMessage
 	} else {
 		note = m.currentDocument.Note
 		if len(note) == 0 {
 			note = "(No memo)"
 		}
 	}
-	note = truncate(" "+note+" ", max(0,
-		m.width-
+	note = truncate.StringWithTail(" "+note+" ", uint(max(0,
+		m.common.width-
 			ansi.PrintableRuneWidth(logo)-
 			ansi.PrintableRuneWidth(statusIndicator)-
 			ansi.PrintableRuneWidth(scrollPercent)-
 			ansi.PrintableRuneWidth(helpNote),
-	))
+	)), ellipsis)
 	if showStatusMessage {
 		note = statusBarMessageStyle(note)
 	} else {
@@ -429,7 +419,7 @@ func (m pagerModel) statusBarView(b *strings.Builder) {
 
 	// Empty space
 	padding := max(0,
-		m.width-
+		m.common.width-
 			ansi.PrintableRuneWidth(logo)-
 			ansi.PrintableRuneWidth(statusIndicator)-
 			ansi.PrintableRuneWidth(note)-
@@ -455,12 +445,12 @@ func (m pagerModel) statusBarView(b *strings.Builder) {
 
 func (m pagerModel) setNoteView(b *strings.Builder) {
 	fmt.Fprint(b, noteHeading)
-	fmt.Fprint(b, textinput.View(m.textInput))
+	fmt.Fprint(b, m.textInput.View())
 }
 
 func (m pagerModel) helpView() (s string) {
 	memoOrStash := "m       set memo"
-	if m.authStatus == authOK && m.currentDocument.markdownType == localMarkdown {
+	if m.common.authStatus == authOK && m.currentDocument.docType == LocalDoc {
 		memoOrStash = "s       stash this document"
 	}
 
@@ -473,7 +463,7 @@ func (m pagerModel) helpView() (s string) {
 		"q       quit",
 	}
 
-	if m.currentDocument.markdownType == newsMarkdown {
+	if m.currentDocument.docType == NewsDoc {
 		deleteFromStringSlice(col1, 3)
 	}
 
@@ -492,11 +482,11 @@ func (m pagerModel) helpView() (s string) {
 	s = indent(s, 2)
 
 	// Fill up empty cells with spaces for background coloring
-	if m.width > 0 {
+	if m.common.width > 0 {
 		lines := strings.Split(s, "\n")
 		for i := 0; i < len(lines); i++ {
 			l := runewidth.StringWidth(lines[i])
-			n := max(m.width-l, 0)
+			n := max(m.common.width-l, 0)
 			lines[i] += strings.Repeat(" ", n)
 		}
 
@@ -529,13 +519,13 @@ func glamourRender(m pagerModel, markdown string) (string, error) {
 
 	// initialize glamour
 	var gs glamour.TermRendererOption
-	if m.glamourStyle == "auto" {
+	if m.common.cfg.GlamourStyle == "auto" {
 		gs = glamour.WithAutoStyle()
 	} else {
-		gs = glamour.WithStylePath(m.glamourStyle)
+		gs = glamour.WithStylePath(m.common.cfg.GlamourStyle)
 	}
 
-	width := max(0, min(maxDocumentWidth, m.viewport.Width))
+	width := max(0, min(int(m.common.cfg.GlamourMaxWidth), m.viewport.Width))
 	r, err := glamour.NewTermRenderer(
 		gs,
 		glamour.WithWordWrap(width),

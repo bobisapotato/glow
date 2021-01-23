@@ -2,96 +2,158 @@ package ui
 
 import (
 	"fmt"
+	"log"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/charm/ui/common"
-	rw "github.com/mattn/go-runewidth"
-	te "github.com/muesli/termenv"
+	lib "github.com/charmbracelet/charm/ui/common"
+	"github.com/muesli/reflow/ansi"
+	"github.com/muesli/reflow/truncate"
+	"github.com/muesli/termenv"
+	"github.com/sahilm/fuzzy"
 )
 
 const (
-	newsPrefix           = "News: "
 	verticalLine         = "│"
 	noMemoTitle          = "No Memo"
 	fileListingStashIcon = "• "
 )
 
-var (
-	greenFg        = te.Style{}.Foreground(common.NewColorPair("#04B575", "#04B575").Color()).Styled
-	fuchsiaFg      = te.Style{}.Foreground(common.Fuschia.Color()).Styled
-	dullFuchsiaFg  = te.Style{}.Foreground(common.NewColorPair("#AD58B4", "#F793FF").Color()).Styled
-	yellowFg       = te.Style{}.Foreground(common.YellowGreen.Color()).Styled                        // renders light green on light backgrounds
-	dullYellowFg   = te.Style{}.Foreground(common.NewColorPair("#9BA92F", "#6BCB94").Color()).Styled // renders light green on light backgrounds
-	subtleIndigoFg = te.Style{}.Foreground(common.NewColorPair("#514DC1", "#7D79F6").Color()).Styled
-	redFg          = te.Style{}.Foreground(common.Red.Color()).Styled
-	faintRedFg     = te.Style{}.Foreground(common.FaintRed.Color()).Styled
-	warmGrayFg     = te.Style{}.Foreground(common.NewColorPair("#979797", "#847A85").Color()).Styled
-)
-
 func stashItemView(b *strings.Builder, m stashModel, index int, md *markdown) {
 	var (
-		truncateTo = m.terminalWidth - stashViewHorizontalPadding*2
+		truncateTo = uint(m.common.width - stashViewHorizontalPadding*2)
 		gutter     string
 		title      = md.Note
-		date       = relativeTime(md.CreatedAt)
+		date       = md.relativeTime()
 		icon       = ""
 	)
 
-	switch md.markdownType {
-	case newsMarkdown:
+	switch md.docType {
+	case NewsDoc:
 		if title == "" {
 			title = "News"
 		} else {
-			title = newsPrefix + truncate(title, truncateTo-rw.StringWidth(newsPrefix))
+			title = truncate.StringWithTail(title, truncateTo, ellipsis)
 		}
-	case stashedMarkdown, convertedMarkdown:
+	case StashedDoc, ConvertedDoc:
 		icon = fileListingStashIcon
 		if title == "" {
 			title = noMemoTitle
 		}
-		title = truncate(title, truncateTo-rw.StringWidth(icon))
+		title = truncate.StringWithTail(title, truncateTo-uint(ansi.PrintableRuneWidth(icon)), ellipsis)
 	default:
-		title = truncate(title, truncateTo)
+		title = truncate.StringWithTail(title, truncateTo, ellipsis)
 	}
 
-	if index == m.index {
-		switch m.state {
-		case stashStatePromptDelete:
-			// Deleting
+	isSelected := index == m.cursor()
+	isFiltering := m.filterState == filtering
+	singleFilteredItem := isFiltering && len(m.getVisibleMarkdowns()) == 1
+
+	// If there are multiple items being filtered don't highlight a selected
+	// item in the results. If we've filtered down to one item, however,
+	// highlight that first item since pressing return will open it.
+	if isSelected && !isFiltering || singleFilteredItem {
+		// Selected item
+
+		switch m.selectionState {
+		case selectionPromptingDelete:
 			gutter = faintRedFg(verticalLine)
 			icon = faintRedFg(icon)
 			title = redFg(title)
 			date = faintRedFg(date)
-		case stashStateSettingNote:
-			// Setting note
+		case selectionSettingNote:
 			gutter = dullYellowFg(verticalLine)
 			icon = ""
-			title = textinput.View(m.noteInput)
+			title = m.noteInput.View()
 			date = dullYellowFg(date)
 		default:
-			// Selected
-			gutter = dullFuchsiaFg(verticalLine)
-			icon = dullFuchsiaFg(icon)
-			title = fuchsiaFg(title)
-			date = dullFuchsiaFg(date)
+			if m.common.latestFileStashed == md.stashID &&
+				m.statusMessage == stashedStatusMessage {
+				gutter = greenFg(verticalLine)
+				icon = dimGreenFg(icon)
+				title = greenFg(title)
+				date = semiDimGreenFg(date)
+			} else {
+				gutter = dullFuchsiaFg(verticalLine)
+				icon = dullFuchsiaFg(icon)
+				if m.currentSection().key == filterSection &&
+					m.filterState == filterApplied || singleFilteredItem {
+					s := termenv.Style{}.Foreground(lib.Fuschia.Color())
+					title = styleFilteredText(title, m.filterInput.Value(), s, s.Underline())
+				} else {
+					title = fuchsiaFg(title)
+				}
+				date = dullFuchsiaFg(date)
+			}
 		}
 	} else {
-		// Normal
-		if md.markdownType == newsMarkdown {
-			gutter = " "
-			title = te.String(title).Foreground(common.Indigo.Color()).String()
-			date = subtleIndigoFg(date)
+		// Regular (non-selected) items
+
+		gutter = " "
+
+		if m.common.latestFileStashed == md.stashID &&
+			m.statusMessage == stashedStatusMessage {
+			icon = dimGreenFg(icon)
+			title = greenFg(title)
+			date = semiDimGreenFg(date)
+		} else if md.docType == NewsDoc {
+			if isFiltering && m.filterInput.Value() == "" {
+				title = dimIndigoFg(title)
+				date = dimSubtleIndigoFg(date)
+			} else {
+				s := termenv.Style{}.Foreground(lib.Indigo.Color())
+				title = styleFilteredText(title, m.filterInput.Value(), s, s.Underline())
+				date = subtleIndigoFg(date)
+			}
+		} else if isFiltering && m.filterInput.Value() == "" {
+			icon = dimGreenFg(icon)
+			if title == noMemoTitle {
+				title = dimBrightGrayFg(title)
+			} else {
+				title = dimNormalFg(title)
+			}
+			date = dimBrightGrayFg(date)
 		} else {
 			icon = greenFg(icon)
 			if title == noMemoTitle {
-				title = warmGrayFg(title)
+				title = brightGrayFg(title)
+			} else {
+				s := termenv.Style{}.Foreground(lib.NewColorPair("#dddddd", "#1a1a1a").Color())
+				title = styleFilteredText(title, m.filterInput.Value(), s, s.Underline())
 			}
-			gutter = " "
-			date = warmGrayFg(date)
+			date = brightGrayFg(date)
 		}
 	}
 
 	fmt.Fprintf(b, "%s %s%s\n", gutter, icon, title)
 	fmt.Fprintf(b, "%s %s", gutter, date)
+}
+
+func styleFilteredText(haystack, needles string, defaultStyle, matchedStyle termenv.Style) string {
+	b := strings.Builder{}
+
+	normalizedHay, err := normalize(haystack)
+	if err != nil && debug {
+		log.Printf("error normalizing '%s': %v", haystack, err)
+	}
+
+	matches := fuzzy.Find(needles, []string{normalizedHay})
+	if len(matches) == 0 {
+		return defaultStyle.Styled(haystack)
+	}
+
+	m := matches[0] // only one match exists
+	for i, rune := range []rune(haystack) {
+		styled := false
+		for _, mi := range m.MatchedIndexes {
+			if i == mi {
+				b.WriteString(matchedStyle.Styled(string(rune)))
+				styled = true
+			}
+		}
+		if !styled {
+			b.WriteString(defaultStyle.Styled(string(rune)))
+		}
+	}
+
+	return b.String()
 }

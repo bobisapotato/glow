@@ -6,7 +6,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,38 +15,32 @@ import (
 	"github.com/charmbracelet/charm"
 	"github.com/charmbracelet/charm/keygen"
 	"github.com/charmbracelet/charm/ui/common"
+	lib "github.com/charmbracelet/charm/ui/common"
+	"github.com/charmbracelet/glow/utils"
 	"github.com/muesli/gitcha"
 	te "github.com/muesli/termenv"
+	"github.com/segmentio/ksuid"
 )
 
 const (
 	noteCharacterLimit   = 256             // should match server
 	statusMessageTimeout = time.Second * 2 // how long to show status messages like "stashed!"
+	ellipsis             = "…"
 )
 
 var (
 	config            Config
-	glowLogoTextColor = common.Color("#ECFD65")
-	debug             = false // true if we're logging to a file, in which case we'll log more stuff
+	glowLogoTextColor = lib.Color("#ECFD65")
+
+	// True if we're logging to a file, in which case we'll log more stuff.
+	debug = false
+
+	// Types of documents we allow the user to stash.
+	stashableDocTypes = NewDocTypeSet(LocalDoc, NewsDoc)
 )
 
-// Config contains TUI-specific configuration.
-type Config struct {
-	ShowAllFiles bool
-	Gopath       string `env:"GOPATH"`
-	HomeDir      string `env:"HOME"`
-
-	// Which document types shall we show? We work though this with bitmasking.
-	DocumentTypes DocumentType
-
-	// For debugging the UI
-	Logfile              string `env:"GLOW_LOGFILE"`
-	HighPerformancePager bool   `env:"GLOW_HIGH_PERFORMANCE_PAGER" default:"true"`
-	GlamourEnabled       bool   `env:"GLOW_ENABLE_GLAMOUR" default:"true"`
-}
-
 // NewProgram returns a new Tea program.
-func NewProgram(style string, cfg Config) *tea.Program {
+func NewProgram(cfg Config) *tea.Program {
 	if cfg.Logfile != "" {
 		log.Println("-- Starting Glow ----------------")
 		log.Printf("High performance pager: %v", cfg.HighPerformancePager)
@@ -55,10 +49,13 @@ func NewProgram(style string, cfg Config) *tea.Program {
 		debug = true
 	}
 	config = cfg
-	return tea.NewProgram(newModel(cfg, style))
+	return tea.NewProgram(newModel(cfg))
 }
 
 type errMsg struct{ err error }
+
+func (e errMsg) Error() string { return e.err.Error() }
+
 type newCharmClientMsg *charm.Client
 type sshAuthErrMsg struct{}
 type keygenFailedMsg struct{ err error }
@@ -74,18 +71,14 @@ type stashLoadErrMsg struct{ err error }
 type gotNewsMsg []*charm.Markdown
 type statusMessageTimeoutMsg applicationContext
 type newsLoadErrMsg struct{ err error }
+type stashSuccessMsg markdown
+type stashFailMsg struct {
+	err      error
+	markdown markdown
+}
 
-func (e errMsg) Error() string          { return e.err.Error() }
-func (e errMsg) Unwrap() error          { return e.err }
-func (k keygenFailedMsg) Error() string { return k.err.Error() }
-func (k keygenFailedMsg) Unwrap() error { return k.err }
-func (s stashLoadErrMsg) Error() string { return s.err.Error() }
-func (s stashLoadErrMsg) Unwrap() error { return s.err }
-func (s newsLoadErrMsg) Error() string  { return s.err.Error() }
-func (s newsLoadErrMsg) Unwrap() error  { return s.err }
-
-// Which part of the application something appies to. Occasionally used as an
-// argument to commands and messages.
+// applicationContext indicates the area of the application something appies
+// to. Occasionally used as an argument to commands and messages.
 type applicationContext int
 
 const (
@@ -93,6 +86,7 @@ const (
 	pagerContext
 )
 
+// state is the top-level application state.
 type state int
 
 const (
@@ -101,9 +95,9 @@ const (
 )
 
 func (s state) String() string {
-	return [...]string{
-		"showing stash",
-		"showing document",
+	return map[state]string{
+		stateShowStash:    "showing file listing",
+		stateShowDocument: "showing document",
 	}[s]
 }
 
@@ -131,18 +125,40 @@ const (
 	keygenFinished
 )
 
+// Common stuff we'll need to access in all models.
+type commonModel struct {
+	cfg        Config
+	cc         *charm.Client
+	cwd        string
+	authStatus authStatus
+	width      int
+	height     int
+
+	// Local IDs of files stashed this session. We treat this like a set,
+	// ignoring the value portion with an empty struct.
+	filesStashed map[ksuid.KSUID]struct{}
+
+	// ID of the most recently stashed markdown
+	latestFileStashed ksuid.KSUID
+
+	// Files currently being stashed. We remove files from this set once
+	// a stash operation has either succeeded or failed.
+	filesStashing map[ksuid.KSUID]struct{}
+}
+
+func (c commonModel) isStashing() bool {
+	return len(c.filesStashing) > 0
+}
+
 type model struct {
-	cfg            *Config
-	cc             *charm.Client
-	authStatus     authStatus
-	keygenState    keygenState
-	state          state
-	fatalErr       error
-	stash          stashModel
-	pager          pagerModel
-	terminalWidth  int
-	terminalHeight int
-	cwd            string // directory from which we're running Glow
+	common      *commonModel
+	state       state
+	keygenState keygenState
+	fatalErr    error
+
+	// Sub-models
+	stash stashModel
+	pager pagerModel
 
 	// Channel that receives paths to local markdown files
 	// (via the github.com/muesli/gitcha package)
@@ -153,7 +169,7 @@ type model struct {
 // method alters the model we also need to send along any commands returned.
 func (m *model) unloadDocument() []tea.Cmd {
 	m.state = stateShowStash
-	m.stash.state = stashStateReady
+	m.stash.viewState = stashStateReady
 	m.pager.unload()
 	m.pager.showHelp = false
 
@@ -162,54 +178,53 @@ func (m *model) unloadDocument() []tea.Cmd {
 		batch = append(batch, tea.ClearScrollArea)
 	}
 
-	if !m.stash.loadingDone() || m.stash.loadingFromNetwork {
-		batch = append(batch, spinner.Tick(m.stash.spinner))
+	if !m.stash.loadingDone() {
+		batch = append(batch, spinner.Tick)
 	}
 	return batch
 }
 
-func (m *model) setAuthStatus(as authStatus) {
-	m.authStatus = as
-	m.stash.authStatus = as
-	m.pager.authStatus = as
-}
-
-func newModel(cfg Config, style string) tea.Model {
-	if style == "auto" {
-		dbg := te.HasDarkBackground()
-		if dbg {
-			style = "dark"
+func newModel(cfg Config) tea.Model {
+	if cfg.GlamourStyle == "auto" {
+		if te.HasDarkBackground() {
+			cfg.GlamourStyle = "dark"
 		} else {
-			style = "light"
+			cfg.GlamourStyle = "light"
 		}
 	}
 
-	if cfg.DocumentTypes == 0 {
-		cfg.DocumentTypes = LocalDocuments | StashedDocuments | NewsDocuments
+	if len(cfg.DocumentTypes) == 0 {
+		cfg.DocumentTypes.Add(LocalDoc, StashedDoc, ConvertedDoc, NewsDoc)
 	}
 
-	as := authConnecting
+	common := commonModel{
+		cfg:           cfg,
+		authStatus:    authConnecting,
+		filesStashed:  make(map[ksuid.KSUID]struct{}),
+		filesStashing: make(map[ksuid.KSUID]struct{}),
+	}
+
 	return model{
-		cfg:         &cfg,
+		common:      &common,
 		state:       stateShowStash,
-		authStatus:  as,
 		keygenState: keygenUnstarted,
-		pager:       newPagerModel(as, style),
-		stash:       newStashModel(&cfg, as),
+		pager:       newPagerModel(&common),
+		stash:       newStashModel(&common),
 	}
 }
 
 func (m model) Init() tea.Cmd {
 	var cmds []tea.Cmd
+	d := m.common.cfg.DocumentTypes
 
-	if m.cfg.DocumentTypes&StashedDocuments != 0 || m.cfg.DocumentTypes&NewsDocuments != 0 {
+	if d.Contains(StashedDoc) || d.Contains(NewsDoc) {
 		cmds = append(cmds,
 			newCharmClient,
-			spinner.Tick(m.stash.spinner),
+			spinner.Tick,
 		)
 	}
 
-	if m.cfg.DocumentTypes&LocalDocuments != 0 {
+	if d.Contains(LocalDoc) {
 		cmds = append(cmds, findLocalFiles(m))
 	}
 
@@ -232,13 +247,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "esc":
 			var cmd tea.Cmd
 
-			// Send these keys through to stash
+			// Send q/esc through to stash
 			switch m.state {
 			case stateShowStash:
 
-				switch m.stash.state {
-				case stashStateSettingNote, stashStatePromptDelete, stashStateShowingError:
-					m.stash, cmd = stashUpdate(msg, m.stash)
+				// Q quits if we're filtering, but we still send esc though.
+				if m.stash.filterApplied() {
+					if msg.String() == "q" {
+						return m, tea.Quit
+					}
+					m.stash, cmd = m.stash.update(msg)
+					return m, cmd
+				}
+
+				// Send q/esc through in these cases
+				switch m.stash.viewState {
+				case stashStateReady:
+
+					// Q also quits glow when displaying only newsitems. Esc
+					// still passes through.
+					if msg.String() == "q" {
+						return m, tea.Quit
+					}
+
+					m.stash, cmd = m.stash.update(msg)
+					return m, cmd
+
+				case stashStateShowingError:
+					m.stash, cmd = m.stash.update(msg)
 					return m, cmd
 				}
 
@@ -248,7 +284,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// If setting a note send all keys straight through
 				case pagerStateSetNote:
 					var batch []tea.Cmd
-					newPagerModel, cmd := m.pager.Update(msg)
+					newPagerModel, cmd := m.pager.update(msg)
 					m.pager = newPagerModel
 					batch = append(batch, cmd)
 					return m, tea.Batch(batch...)
@@ -278,31 +314,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Ctrl+C always quits no matter where in the application you are.
 		case "ctrl+c":
 			return m, tea.Quit
-
-		// Repaint
-		case "ctrl+l":
-			// TODO
-			return m, nil
 		}
 
 	// Window size is received when starting up and on every resize
 	case tea.WindowSizeMsg:
-		m.terminalWidth = msg.Width
-		m.terminalHeight = msg.Height
+		m.common.width = msg.Width
+		m.common.height = msg.Height
 		m.stash.setSize(msg.Width, msg.Height)
 		m.pager.setSize(msg.Width, msg.Height)
 
-		// TODO: load more stash pages if we've resized, are on the last page,
-		// and haven't loaded more pages yet.
-
 	case initLocalFileSearchMsg:
 		m.localFileFinder = msg.ch
-		m.cwd = msg.cwd
-		cmds = append(cmds, findNextLocalFile(m))
-
-	case foundLocalFileMsg:
-		newMd := localFileToMarkdown(m.cwd, gitcha.SearchResult(msg))
-		m.stash.addMarkdowns(newMd)
+		m.common.cwd = msg.cwd
 		cmds = append(cmds, findNextLocalFile(m))
 
 	case sshAuthErrMsg:
@@ -311,20 +334,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, generateSSHKeys)
 		} else {
 			// The keygen ran but things still didn't work and we can't auth
-			m.setAuthStatus(authFailed)
+			m.common.authStatus = authFailed
 			m.stash.err = errors.New("SSH authentication failed; we tried ssh-agent, loading keys from disk, and generating SSH keys")
 			if debug {
 				log.Println("entering offline mode;", m.stash.err)
 			}
 
 			// Even though it failed, news/stash loading is finished
-			m.stash.loaded |= StashedDocuments | NewsDocuments
-			m.stash.loadingFromNetwork = false
+			m.stash.loaded.Add(StashedDoc, NewsDoc)
 		}
 
 	case keygenFailedMsg:
 		// Keygen failed. That sucks.
-		m.setAuthStatus(authFailed)
+		m.common.authStatus = authFailed
 		m.stash.err = errors.New("could not authenticate; could not generate SSH keys")
 		if debug {
 			log.Println("entering offline mode;", m.stash.err)
@@ -333,8 +355,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.keygenState = keygenFinished
 
 		// Even though it failed, news/stash loading is finished
-		m.stash.loaded |= StashedDocuments | NewsDocuments
-		m.stash.loadingFromNetwork = false
+		m.stash.loaded.Add(StashedDoc, NewsDoc)
 
 	case keygenSuccessMsg:
 		// The keygen's done, so let's try initializing the charm client again
@@ -342,57 +363,95 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, newCharmClient)
 
 	case newCharmClientMsg:
-		m.cc = msg
-		m.setAuthStatus(authOK)
-		m.stash.cc = msg
-		m.pager.cc = msg
+		m.common.cc = msg
+		m.common.authStatus = authOK
 		cmds = append(cmds, loadStash(m.stash), loadNews(m.stash))
 
 	case stashLoadErrMsg:
-		m.setAuthStatus(authFailed)
+		m.common.authStatus = authFailed
 
 	case fetchedMarkdownMsg:
+		// We've loaded a markdown file's contents for rendering
 		m.pager.currentDocument = *msg
+		msg.Body = string(utils.RemoveFrontmatter([]byte(msg.Body)))
 		cmds = append(cmds, renderWithGlamour(m.pager, msg.Body))
 
 	case contentRenderedMsg:
 		m.state = stateShowDocument
 
 	case noteSavedMsg:
-		// A note was saved to a document. This will have be done in the
+		// A note was saved to a document. This will have been done in the
 		// pager, so we'll need to find the corresponding note in the stash.
 		// So, pass the message to the stash for processing.
-		stashModel, cmd := stashUpdate(msg, m.stash)
+		stashModel, cmd := m.stash.update(msg)
 		m.stash = stashModel
 		return m, cmd
 
 	case localFileSearchFinished, gotStashMsg, gotNewsMsg:
-		// Also pass these messages to the stash so we can keep it updated
-		// about network activity.
-		stashModel, cmd := stashUpdate(msg, m.stash)
+		// Always pass these messages to the stash so we can keep it updated
+		// about network activity, even if the user isn't currently viewing
+		// the stash.
+		stashModel, cmd := m.stash.update(msg)
 		m.stash = stashModel
 		return m, cmd
 
+	case foundLocalFileMsg:
+		newMd := localFileToMarkdown(m.common.cwd, gitcha.SearchResult(msg))
+		m.stash.addMarkdowns(newMd)
+		if m.stash.filterApplied() {
+			newMd.buildFilterValue()
+		}
+		if m.stash.shouldUpdateFilter() {
+			cmds = append(cmds, filterMarkdowns(m.stash))
+		}
+		cmds = append(cmds, findNextLocalFile(m))
+
 	case stashSuccessMsg:
-		// Something was stashed. Update the stash listing but don't run an
-		// actual update on the stash since we don't want to trigger the status
-		// message and generally don't want any other effects.
+		// Common handling that should happen regardless of application state
+		md := markdown(msg)
+		m.stash.addMarkdowns(&md)
+		m.common.filesStashed[msg.stashID] = struct{}{}
+		delete(m.common.filesStashing, md.stashID)
+
+		if m.stash.filterApplied() {
+			for _, v := range m.stash.filteredMarkdowns {
+				if v.stashID == msg.stashID && v.docType == ConvertedDoc {
+					// Add the server-side ID we got back so we can do things
+					// like rename and stash it.
+					v.ID = msg.ID
+
+					// Keep the unique ID in sync so we can do things like
+					// delete. Note that the markdown received a new unique ID
+					// when it was added to the file listing in
+					// stash.addMarkdowns.
+					v.uniqueID = md.uniqueID
+					break
+				}
+			}
+		}
+
+	case stashFailMsg:
+		// Common handling that should happen regardless of application state
+		delete(m.common.filesStashed, msg.markdown.stashID)
+		delete(m.common.filesStashing, msg.markdown.stashID)
+
+	case filteredMarkdownMsg:
 		if m.state == stateShowDocument {
-			md := markdown(msg)
-			_ = m.stash.removeLocalMarkdown(md.localPath)
-			m.stash.addMarkdowns(&md)
+			newStashModel, cmd := m.stash.update(msg)
+			m.stash = newStashModel
+			cmds = append(cmds, cmd)
 		}
 	}
 
 	// Process children
 	switch m.state {
 	case stateShowStash:
-		newStashModel, cmd := stashUpdate(msg, m.stash)
+		newStashModel, cmd := m.stash.update(msg)
 		m.stash = newStashModel
 		cmds = append(cmds, cmd)
 
 	case stateShowDocument:
-		newPagerModel, cmd := m.pager.Update(msg)
+		newPagerModel, cmd := m.pager.update(msg)
 		m.pager = newPagerModel
 		cmds = append(cmds, cmd)
 	}
@@ -409,7 +468,7 @@ func (m model) View() string {
 	case stateShowDocument:
 		return m.pager.View()
 	default:
-		return stashView(m.stash)
+		return m.stash.view()
 	}
 }
 
@@ -422,8 +481,8 @@ func errorView(err error, fatal bool) string {
 	}
 	s := fmt.Sprintf("%s\n\n%v\n\n%s",
 		te.String(" ERROR ").
-			Foreground(common.Cream.Color()).
-			Background(common.Red.Color()).
+			Foreground(lib.Cream.Color()).
+			Background(lib.Red.Color()).
 			String(),
 		err,
 		common.Subtle(exitMsg),
@@ -435,7 +494,22 @@ func errorView(err error, fatal bool) string {
 
 func findLocalFiles(m model) tea.Cmd {
 	return func() tea.Msg {
-		cwd, err := os.Getwd()
+		var (
+			cwd = m.common.cfg.WorkingDirectory
+			err error
+		)
+
+		if cwd == "" {
+			cwd, err = os.Getwd()
+		} else {
+			var info os.FileInfo
+			info, err = os.Stat(cwd)
+			if err == nil && info.IsDir() {
+				cwd, err = filepath.Abs(cwd)
+			}
+		}
+
+		// Note that this is one error check for both cases above
 		if err != nil {
 			if debug {
 				log.Println("error finding local files:", err)
@@ -443,8 +517,12 @@ func findLocalFiles(m model) tea.Cmd {
 			return errMsg{err}
 		}
 
+		if debug {
+			log.Println("local directory is:", cwd)
+		}
+
 		var ignore []string
-		if !m.cfg.ShowAllFiles {
+		if !m.common.cfg.ShowAllFiles {
 			ignore = ignorePatterns(m)
 		}
 
@@ -500,14 +578,14 @@ func newCharmClient() tea.Msg {
 
 func loadStash(m stashModel) tea.Cmd {
 	return func() tea.Msg {
-		if m.cc == nil {
+		if m.common.cc == nil {
 			err := errors.New("no charm client")
 			if debug {
 				log.Println("error loading stash:", err)
 			}
 			return stashLoadErrMsg{err}
 		}
-		stash, err := m.cc.GetStash(m.page)
+		stash, err := m.common.cc.GetStash(m.serverPage)
 		if err != nil {
 			if debug {
 				if _, ok := err.(charm.ErrAuthFailed); ok {
@@ -518,25 +596,31 @@ func loadStash(m stashModel) tea.Cmd {
 			}
 			return stashLoadErrMsg{err}
 		}
+		if debug {
+			log.Println("loaded stash page", m.serverPage)
+		}
 		return gotStashMsg(stash)
 	}
 }
 
 func loadNews(m stashModel) tea.Cmd {
 	return func() tea.Msg {
-		if m.cc == nil {
+		if m.common.cc == nil {
 			err := errors.New("no charm client")
 			if debug {
 				log.Println("error loading news:", err)
 			}
 			return newsLoadErrMsg{err}
 		}
-		news, err := m.cc.GetNews(1) // just fetch the first page
+		news, err := m.common.cc.GetNews(1) // just fetch the first page
 		if err != nil {
 			if debug {
 				log.Println("error loading news:", err)
 			}
 			return newsLoadErrMsg{err}
+		}
+		if debug {
+			log.Println("fetched news")
 		}
 		return gotNewsMsg(news)
 	}
@@ -583,48 +667,63 @@ func saveDocumentNote(cc *charm.Client, id int, note string) tea.Cmd {
 func stashDocument(cc *charm.Client, md markdown) tea.Cmd {
 	return func() tea.Msg {
 		if cc == nil {
-			return func() tea.Msg {
-				err := errors.New("can't stash; no charm client")
-				if debug {
-					log.Println("error stashing document:", err)
-				}
-				return stashErrMsg{err}
+			err := errors.New("can't stash; no charm client")
+			if debug {
+				log.Println("error stashing document:", err)
 			}
+			return stashFailMsg{err, md}
 		}
 
 		// Is the document missing a body? If so, it likely means it needs to
-		// be loaded. If the document body is really empty then we'll still
-		// stash it.
+		// be loaded. But...if it turns out the document body really is empty
+		// then we'll stash it anyway.
 		if len(md.Body) == 0 {
-			data, err := ioutil.ReadFile(md.localPath)
-			if err != nil {
-				if debug {
-					log.Println("error loading doucument body for stashing:", err)
+			switch md.docType {
+
+			case LocalDoc:
+				data, err := ioutil.ReadFile(md.localPath)
+				if err != nil {
+					if debug {
+						log.Println("error loading document body for stashing:", err)
+					}
+					return stashFailMsg{err, md}
 				}
-				return stashErrMsg{err}
+				md.Body = string(data)
+
+			case NewsDoc:
+				newMD, err := fetchMarkdown(cc, md.ID, md.docType)
+				if err != nil {
+					if debug {
+						log.Println(err)
+					}
+					return stashFailMsg{err, md}
+				}
+				md.Body = newMD.Body
+
+			default:
+				err := fmt.Errorf("user is attempting to stash an unsupported markdown type: %s", md.docType)
+				if debug {
+					log.Println(err)
+				}
+				return stashFailMsg{err, md}
 			}
-			md.Body = string(data)
 		}
-
-		// Turn local markdown into a newly stashed (converted) markdown
-		md.markdownType = convertedMarkdown
-		md.CreatedAt = time.Now()
-
-		// Set the note as the filename without the extension
-		p := md.localPath
-		md.Note = strings.Replace(path.Base(p), path.Ext(p), "", 1)
 
 		newMd, err := cc.StashMarkdown(md.Note, md.Body)
 		if err != nil {
 			if debug {
 				log.Println("error stashing document:", err)
 			}
-			return stashErrMsg{err}
+			return stashFailMsg{err, md}
 		}
 
-		// We really just need to know the ID so we can operate on this newly
-		// stashed markdown.
+		md.convertToStashed()
+
+		// The server sends the whole stashed document back, but we really just
+		// need to know the ID so we can operate on this newly stashed
+		// markdown.
 		md.ID = newMd.ID
+
 		return stashSuccessMsg(md)
 	}
 }
@@ -638,21 +737,24 @@ func waitForStatusMessageTimeout(appCtx applicationContext, t *time.Timer) tea.C
 
 // ETC
 
-// Convert local file path to Markdown. Note that we could be doing things
-// like checking if the file is a directory, but we trust that gitcha has
-// already done that.
+// Convert a Gitcha result to an internal representation of a markdown
+// document. Note that we could be doing things like checking if the file is
+// a directory, but we trust that gitcha has already done that.
 func localFileToMarkdown(cwd string, res gitcha.SearchResult) *markdown {
 	md := &markdown{
-		markdownType: localMarkdown,
-		localPath:    res.Path,
-		displayPath:  strings.Replace(res.Path, cwd+"/", "", -1), // strip absolute path
-		Markdown:     charm.Markdown{},
+		docType:   LocalDoc,
+		localPath: res.Path,
+		Markdown: charm.Markdown{
+			Note:      stripAbsolutePath(res.Path, cwd),
+			CreatedAt: res.Info.ModTime(),
+		},
 	}
 
-	md.Markdown.Note = md.displayPath
-	md.CreatedAt = res.Info.ModTime() // last modified time
-
 	return md
+}
+
+func stripAbsolutePath(fullPath, cwd string) string {
+	return strings.Replace(fullPath, cwd+string(os.PathSeparator), "", -1)
 }
 
 // Lightweight version of reflow's indent function.
